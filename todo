@@ -1,0 +1,10 @@
+// todo
+cache中的lru应该放到段里面去做，
+
+需要明确的是链表的结构是用来做清理的，那么cap这个字段应该是segment的cap做同步！！！！
+
+所以清理的过程就是在lru这个窗口函数做的，从slru2排除到slru1,再从slru1中battle失败被放入到lru中，再从lru中被battle出去来删除
+
+然后如果expreation了的key，那么就要根据hdr中的stage来判断是在哪个lru中，然后再通过遍历来删除,因为数据已经从segment，三个lru中层层分派了，所以遍历的代价不高
+
+最后面就是废除mutex改用读写锁罗！！！

@@ -2,10 +2,10 @@ package freecache
 
 import (
 	"encoding/binary"
+	"github.com/bits-and-blooms/bloom/v3"
+	"github.com/cespare/xxhash/v2"
 	"sync"
 	"sync/atomic"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 const (
@@ -14,12 +14,23 @@ const (
 	// segmentAndOpVal is bitwise AND applied to the hashVal to find the segment id.
 	segmentAndOpVal = 255
 	minBufSize      = 512 * 1024
+
+	LRUSTAGE   = 0
+	SLRUSTAGE1 = 1
+	SLRUSTAGE2 = 2
 )
 
 // Cache is a freecache instance.
 type Cache struct {
 	locks    [segmentCount]sync.Mutex
 	segments [segmentCount]segment
+	filter   *bloom.BloomFilter
+	c        *cmSketch
+	firstLru *firstLru
+}
+type cacheItem struct {
+	stage uint8
+	value []byte
 }
 
 type Updater func(value []byte, found bool) (newValue []byte, replace bool, expireSeconds int)
@@ -34,7 +45,13 @@ func hashFunc(data []byte) uint64 {
 // `debug.SetGCPercent()`, set it to a much smaller value
 // to limit the memory consumption and GC pause time.
 func NewCache(size int) (cache *Cache) {
-	return NewCacheCustomTimer(size, defaultTimer{})
+	filter := bloom.NewWithEstimates(uint(size*10), 0.01)
+	c := newCmSketch(int64(size * 10))
+	cache = NewCacheCustomTimer(size, defaultTimer{})
+	cache.filter = filter
+	cache.c = c
+	cache.firstLru = newFirstLRU(size)
+	return cache
 }
 
 // NewCacheCustomTimer returns new cache with custom timer.
@@ -60,7 +77,18 @@ func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
-	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	if !cache.filter.TestOrAdd(key) {
+		err = cache.segments[segID].set(key, value, hashVal, expireSeconds, LRUSTAGE)
+		cache.filter.Add(key)
+		cache.c.Increment(hashVal)
+		eitem, evicted := cache.firstLru.add(key)
+		if !evicted {
+			return
+		}
+		//如果firstLru容量满了，放回了一个需要淘汰的数据
+
+	}
+
 	cache.locks[segID].Unlock()
 	return
 }
@@ -77,11 +105,11 @@ func (cache *Cache) Touch(key []byte, expireSeconds int) (err error) {
 }
 
 // Get returns the value or not found error.
-func (cache *Cache) Get(key []byte) (value []byte, err error) {
+func (cache *Cache) Get(key []byte) (value []byte, lfuStage uint8, err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
-	value, _, err = cache.segments[segID].get(key, nil, hashVal, false)
+	value, _, lfuStage, err = cache.segments[segID].get(key, nil, hashVal, false)
 	cache.locks[segID].Unlock()
 	return
 }
@@ -112,9 +140,9 @@ func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []b
 	cache.locks[segID].Lock()
 	defer cache.locks[segID].Unlock()
 
-	retValue, _, err = cache.segments[segID].get(key, nil, hashVal, false)
+	retValue, _, _, err = cache.segments[segID].get(key, nil, hashVal, false)
 	if err != nil {
-		err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+		err = cache.segments[segID].set(key, value, hashVal, expireSeconds, 0)
 	}
 	return
 }
@@ -129,12 +157,12 @@ func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
 	defer cache.locks[segID].Unlock()
-
-	retValue, _, err = cache.segments[segID].get(key, nil, hashVal, false)
+	var lfuStage uint8
+	retValue, _, lfuStage, err = cache.segments[segID].get(key, nil, hashVal, false)
 	if err == nil {
 		found = true
 	}
-	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	err = cache.segments[segID].set(key, value, hashVal, expireSeconds, lfuStage)
 	return
 }
 
@@ -150,7 +178,7 @@ func (cache *Cache) Update(key []byte, updater Updater) (found bool, replaced bo
 	cache.locks[segID].Lock()
 	defer cache.locks[segID].Unlock()
 
-	retValue, _, err := cache.segments[segID].get(key, nil, hashVal, false)
+	retValue, _, lfuStage, err := cache.segments[segID].get(key, nil, hashVal, false)
 	if err == nil {
 		found = true
 	} else {
@@ -160,7 +188,7 @@ func (cache *Cache) Update(key []byte, updater Updater) (found bool, replaced bo
 	if !replaced {
 		return
 	}
-	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
+	err = cache.segments[segID].set(key, value, hashVal, expireSeconds, lfuStage)
 	return
 }
 
@@ -169,7 +197,7 @@ func (cache *Cache) Peek(key []byte) (value []byte, err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
-	value, _, err = cache.segments[segID].get(key, nil, hashVal, true)
+	value, _, _, err = cache.segments[segID].get(key, nil, hashVal, true)
 	cache.locks[segID].Unlock()
 	return
 }
@@ -198,7 +226,7 @@ func (cache *Cache) GetWithBuf(key, buf []byte) (value []byte, err error) {
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
-	value, _, err = cache.segments[segID].get(key, buf, hashVal, false)
+	value, _, _, err = cache.segments[segID].get(key, buf, hashVal, false)
 	cache.locks[segID].Unlock()
 	return
 }
@@ -208,7 +236,7 @@ func (cache *Cache) GetWithExpiration(key []byte) (value []byte, expireAt uint32
 	hashVal := hashFunc(key)
 	segID := hashVal & segmentAndOpVal
 	cache.locks[segID].Lock()
-	value, expireAt, err = cache.segments[segID].get(key, nil, hashVal, false)
+	value, expireAt, _, err = cache.segments[segID].get(key, nil, hashVal, false)
 	cache.locks[segID].Unlock()
 	return
 }
@@ -237,14 +265,15 @@ func (cache *Cache) Del(key []byte) (affected bool) {
 func (cache *Cache) SetInt(key int64, value []byte, expireSeconds int) (err error) {
 	var bKey [8]byte
 	binary.LittleEndian.PutUint64(bKey[:], uint64(key))
-	return cache.Set(bKey[:], value, expireSeconds)
+	return cache.Set(bKey[:], value, expireSeconds, 0)
 }
 
 // GetInt returns the value for an integer within the cache or a not found error.
 func (cache *Cache) GetInt(key int64) (value []byte, err error) {
 	var bKey [8]byte
 	binary.LittleEndian.PutUint64(bKey[:], uint64(key))
-	return cache.Get(bKey[:])
+	value, _, err = cache.Get(bKey[:])
+	return
 }
 
 // GetIntWithExpiration returns the value and expiration or a not found error.

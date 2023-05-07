@@ -7,7 +7,7 @@ import (
 )
 
 const HASH_ENTRY_SIZE = 16
-const ENTRY_HDR_SIZE = 24
+const ENTRY_HDR_SIZE = 25
 
 var ErrLargeKey = errors.New("The key is larger than 65535")
 var ErrLargeEntry = errors.New("The entry size is larger than 1/1024 of cache size")
@@ -32,6 +32,7 @@ type entryHdr struct {
 	deleted    bool
 	slotId     uint8
 	reserved   uint16
+	lfuStage   uint8
 }
 
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
@@ -66,7 +67,7 @@ func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
 	return
 }
 
-func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (err error) {
+func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int, lfuStage uint8) (err error) {
 	if len(key) > 65535 {
 		return ErrLargeKey
 	}
@@ -128,7 +129,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 			hdr.valCap = 1
 		}
 	}
-
+	hdr.lfuStage = lfuStage
 	entryLen := ENTRY_HDR_SIZE + int64(len(key)) + int64(hdr.valCap)
 	slotModified := seg.evacuate(entryLen, slotId, now)
 	if slotModified {
@@ -235,11 +236,12 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 	return
 }
 
-func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
+func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, lfuStage uint8, err error) {
 	hdr, ptrOffset, err := seg.locate(key, hashVal, peek)
 	if err != nil {
 		return
 	}
+	lfuStage = hdr.lfuStage
 	expireAt = hdr.expireAt
 	if cap(buf) >= int(hdr.valLen) {
 		value = buf[:hdr.valLen]
